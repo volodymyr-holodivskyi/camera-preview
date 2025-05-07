@@ -23,6 +23,8 @@ class CameraController: NSObject {
     var rearCamera: AVCaptureDevice?
     var rearCameraInput: AVCaptureDeviceInput?
 
+    var fileVideoOutput: AVCaptureMovieFileOutput?
+
     var previewLayer: AVCaptureVideoPreviewLayer?
 
     var flashMode = AVCaptureDevice.FlashMode.off
@@ -36,152 +38,136 @@ class CameraController: NSObject {
     var audioInput: AVCaptureDeviceInput?
 
     var zoomFactor: CGFloat = 1.0
+
+    var videoFileURL: URL?
 }
 
 extension CameraController {
-    func prepare(cameraPosition: String, disableAudio: Bool, completionHandler: @escaping (Error?) -> Void) {
-    let prepareQueue = DispatchQueue(label: "camera.prepare.queue")
-
-    prepareQueue.async { [weak self] in
-        guard let self = self else { return }
-
+    func prepare(cameraPosition: String, disableAudio: Bool, cameraMode: Bool, completionHandler: @escaping (Error?) -> Void) {
         func createCaptureSession() {
             self.captureSession = AVCaptureSession()
         }
 
         func configureCaptureDevices() throws {
-            let session = AVCaptureDevice.DiscoverySession(
-                deviceTypes: [.builtInWideAngleCamera],
-                mediaType: .video,
-                position: .unspecified
-            )
 
-            let cameras = session.devices
-            guard !cameras.isEmpty else {
-                throw CameraControllerError.noCamerasAvailable
-            }
+            let session = AVCaptureDevice.DiscoverySession(deviceTypes: [.builtInWideAngleCamera], mediaType: AVMediaType.video, position: .unspecified)
+
+            let cameras = session.devices.compactMap { $0 }
+            guard !cameras.isEmpty else { throw CameraControllerError.noCamerasAvailable }
 
             for camera in cameras {
-                switch camera.position {
-                case .front:
+                if camera.position == .front {
                     self.frontCamera = camera
-                case .back:
+                }
+
+                if camera.position == .back {
                     self.rearCamera = camera
+
                     try camera.lockForConfiguration()
                     camera.focusMode = .continuousAutoFocus
                     camera.unlockForConfiguration()
-                default:
-                    break
                 }
             }
-
-            if !disableAudio {
-                self.audioDevice = AVCaptureDevice.default(for: .audio)
+            if disableAudio == false {
+                self.audioDevice = AVCaptureDevice.default(for: AVMediaType.audio)
             }
         }
 
         func configureDeviceInputs() throws {
-            guard let captureSession = self.captureSession else {
-                throw CameraControllerError.captureSessionIsMissing
-            }
+            guard let captureSession = self.captureSession else { throw CameraControllerError.captureSessionIsMissing }
 
-            if cameraPosition == "rear", let rearCamera = self.rearCamera {
-                let rearInput = try AVCaptureDeviceInput(device: rearCamera)
-                if captureSession.canAddInput(rearInput) {
-                    captureSession.addInput(rearInput)
-                    self.rearCameraInput = rearInput
+            if cameraPosition == "rear" {
+                if let rearCamera = self.rearCamera {
+                    self.rearCameraInput = try AVCaptureDeviceInput(device: rearCamera)
+
+                    if captureSession.canAddInput(self.rearCameraInput!) { captureSession.addInput(self.rearCameraInput!) }
+
                     self.currentCameraPosition = .rear
                 }
-            } else if cameraPosition == "front", let frontCamera = self.frontCamera {
-                let frontInput = try AVCaptureDeviceInput(device: frontCamera)
-                if captureSession.canAddInput(frontInput) {
-                    captureSession.addInput(frontInput)
-                    self.frontCameraInput = frontInput
-                    self.currentCameraPosition = .front
-                } else {
-                    throw CameraControllerError.inputsAreInvalid
-                }
-            } else {
-                throw CameraControllerError.noCamerasAvailable
-            }
+            } else if cameraPosition == "front" {
+                if let frontCamera = self.frontCamera {
+                    self.frontCameraInput = try AVCaptureDeviceInput(device: frontCamera)
 
-            if !disableAudio, let audioDevice = self.audioDevice {
-                let audioInput = try AVCaptureDeviceInput(device: audioDevice)
-                if captureSession.canAddInput(audioInput) {
-                    captureSession.addInput(audioInput)
-                    self.audioInput = audioInput
-                } else {
-                    throw CameraControllerError.inputsAreInvalid
+                    if captureSession.canAddInput(self.frontCameraInput!) { captureSession.addInput(self.frontCameraInput!) } else { throw CameraControllerError.inputsAreInvalid }
+
+                    self.currentCameraPosition = .front
+                }
+            } else { throw CameraControllerError.noCamerasAvailable }
+
+            // Add audio input
+            if disableAudio == false {
+                if let audioDevice = self.audioDevice {
+                    self.audioInput = try AVCaptureDeviceInput(device: audioDevice)
+                    if captureSession.canAddInput(self.audioInput!) {
+                        captureSession.addInput(self.audioInput!)
+                    } else {
+                        throw CameraControllerError.inputsAreInvalid
+                    }
                 }
             }
         }
 
-        func configurePhotoOutput() throws {
-            guard let captureSession = self.captureSession else {
-                throw CameraControllerError.captureSessionIsMissing
+        func configurePhotoOutput(cameraMode: Bool) throws {
+            guard let captureSession = self.captureSession else { throw CameraControllerError.captureSessionIsMissing }
+
+            //  TODO: check if that really useful
+            if !cameraMode && self.highResolutionOutput && captureSession.canSetSessionPreset(.photo) {
+                captureSession.sessionPreset = .photo
+            } else if cameraMode && self.highResolutionOutput && captureSession.canSetSessionPreset(.high) {
+                captureSession.sessionPreset = .high
             }
 
-            let output = AVCapturePhotoOutput()
+            self.photoOutput = AVCapturePhotoOutput()
+            self.photoOutput!.setPreparedPhotoSettingsArray([AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])], completionHandler: nil)
+            self.photoOutput?.isHighResolutionCaptureEnabled = self.highResolutionOutput
+            if captureSession.canAddOutput(self.photoOutput!) { captureSession.addOutput(self.photoOutput!) }
 
-            if output.isPreparedPhotoSettingsArraySupported {
-                output.setPreparedPhotoSettingsArray(
-                    [AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])],
-                    completionHandler: nil
-                )
+            let fileVideoOutput = AVCaptureMovieFileOutput()
+            if captureSession.canAddOutput(fileVideoOutput) {
+                captureSession.addOutput(fileVideoOutput)
+                self.fileVideoOutput = fileVideoOutput
             }
-
-            output.isHighResolutionCaptureEnabled = self.highResolutionOutput
-
-            if captureSession.canAddOutput(output) {
-                captureSession.addOutput(output)
-                self.photoOutput = output
-            }
-
-            if !captureSession.isRunning {
-                captureSession.startRunning()
-            }
+            captureSession.startRunning()
         }
 
         func configureDataOutput() throws {
-            guard let captureSession = self.captureSession else {
-                throw CameraControllerError.captureSessionIsMissing
-            }
+            guard let captureSession = self.captureSession else { throw CameraControllerError.captureSessionIsMissing }
 
-            let output = AVCaptureVideoDataOutput()
-            output.videoSettings = [
-                kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA)
+            self.dataOutput = AVCaptureVideoDataOutput()
+            self.dataOutput?.videoSettings = [
+                (kCVPixelBufferPixelFormatTypeKey as String): NSNumber(value: kCVPixelFormatType_32BGRA as UInt32)
             ]
-            output.alwaysDiscardsLateVideoFrames = true
-
-            if captureSession.canAddOutput(output) {
-                captureSession.addOutput(output)
-                self.dataOutput = output
+            self.dataOutput?.alwaysDiscardsLateVideoFrames = true
+            if captureSession.canAddOutput(self.dataOutput!) {
+                captureSession.addOutput(self.dataOutput!)
             }
 
             captureSession.commitConfiguration()
 
-            let dataQueue = DispatchQueue(label: "camera.data.queue")
-            output.setSampleBufferDelegate(self, queue: dataQueue)
+            let queue = DispatchQueue(label: "DataOutput", attributes: [])
+            self.dataOutput?.setSampleBufferDelegate(self, queue: queue)
         }
 
-        // Main execution flow
-        do {
-            createCaptureSession()
-            try configureCaptureDevices()
-            try configureDeviceInputs()
-            try configurePhotoOutput()
-            try configureDataOutput()
-        } catch {
-            DispatchQueue.main.async {
-                completionHandler(error)
+        DispatchQueue(label: "prepare").async {
+            do {
+                createCaptureSession()
+                try configureCaptureDevices()
+                try configureDeviceInputs()
+                try configurePhotoOutput(cameraMode: cameraMode)
+                try configureDataOutput()
+                // try configureVideoOutput()
+            } catch {
+                DispatchQueue.main.async {
+                    completionHandler(error)
+                }
+
+                return
             }
-            return
-        }
 
-        DispatchQueue.main.async {
-            completionHandler(nil)
+            DispatchQueue.main.async {
+                completionHandler(nil)
+            }
         }
-    }
     }
 
     func displayPreview(on view: UIView) throws {
@@ -216,21 +202,35 @@ extension CameraController {
     }
 
     func updateVideoOrientation() {
-        assert(Thread.isMainThread) // UIApplication.statusBarOrientation requires the main thread.
+        if Thread.isMainThread {
+            updateVideoOrientationOnMainThread()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.updateVideoOrientationOnMainThread()
+            }
+        }
+    }
 
+    private func updateVideoOrientationOnMainThread() {
         let videoOrientation: AVCaptureVideoOrientation
-        switch UIApplication.shared.statusBarOrientation {
-        case .portrait:
-            videoOrientation = .portrait
-        case .landscapeLeft:
-            videoOrientation = .landscapeLeft
-        case .landscapeRight:
-            videoOrientation = .landscapeRight
-        case .portraitUpsideDown:
-            videoOrientation = .portraitUpsideDown
-        case .unknown:
-            fallthrough
-        @unknown default:
+        
+        // Use window scene interface orientation
+        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+            switch windowScene.interfaceOrientation {
+            case .portrait:
+                videoOrientation = .portrait
+            case .landscapeLeft:
+                videoOrientation = .landscapeLeft
+            case .landscapeRight:
+                videoOrientation = .landscapeRight
+            case .portraitUpsideDown:
+                videoOrientation = .portraitUpsideDown
+            case .unknown:
+                fallthrough
+            @unknown default:
+                videoOrientation = .portrait
+            }
+        } else {
             videoOrientation = .portrait
         }
 
@@ -240,53 +240,98 @@ extension CameraController {
     }
 
     func switchCameras() throws {
-        guard let currentCameraPosition = currentCameraPosition, let captureSession = self.captureSession, captureSession.isRunning else { throw CameraControllerError.captureSessionIsMissing }
-
+        guard let currentCameraPosition = currentCameraPosition,
+              let captureSession = self.captureSession else {
+            throw CameraControllerError.captureSessionIsMissing
+        }
+        
+        // Ensure we have the necessary cameras
+        guard (currentCameraPosition == .front && rearCamera != nil) ||
+              (currentCameraPosition == .rear && frontCamera != nil) else {
+            throw CameraControllerError.noCamerasAvailable
+        }
+        
+        // Store the current running state
+        let wasRunning = captureSession.isRunning
+        if wasRunning {
+            captureSession.stopRunning()
+        }
+        
+        // Begin configuration
         captureSession.beginConfiguration()
+        defer {
+            captureSession.commitConfiguration()
+            // Restart the session if it was running before
+            if wasRunning {
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    self?.captureSession?.startRunning()
+                }
+            }
+        }
+        
+        // Store audio input if it exists
+        let audioInput = captureSession.inputs.first { ($0 as? AVCaptureDeviceInput)?.device.hasMediaType(.audio) ?? false }
 
-        func switchToFrontCamera() throws {
+        // Remove only video inputs
+        captureSession.inputs.forEach { input in
+            if (input as? AVCaptureDeviceInput)?.device.hasMediaType(.video) ?? false {
+            captureSession.removeInput(input)
+            }
+        }
+        
+        // Configure new camera
+        switch currentCameraPosition {
+        case .front:
+            guard let rearCamera = rearCamera else {
+                throw CameraControllerError.invalidOperation
+            }
+            
+            // Configure rear camera
+            try rearCamera.lockForConfiguration()
+            if rearCamera.isFocusModeSupported(.continuousAutoFocus) {
+                rearCamera.focusMode = .continuousAutoFocus
+            }
+            rearCamera.unlockForConfiguration()
+            
+            if let newInput = try? AVCaptureDeviceInput(device: rearCamera),
+                captureSession.canAddInput(newInput) {
+                captureSession.addInput(newInput)
+                rearCameraInput = newInput
+                self.currentCameraPosition = .rear
+            } else {
+                throw CameraControllerError.invalidOperation
+            }
+        case .rear:
+            guard let frontCamera = frontCamera else {
+                throw CameraControllerError.invalidOperation
+            }
 
-            guard let rearCameraInput = self.rearCameraInput, captureSession.inputs.contains(rearCameraInput),
-                  let frontCamera = self.frontCamera else { throw CameraControllerError.invalidOperation }
-
-            self.frontCameraInput = try AVCaptureDeviceInput(device: frontCamera)
-
-            captureSession.removeInput(rearCameraInput)
-
-            if captureSession.canAddInput(self.frontCameraInput!) {
-                captureSession.addInput(self.frontCameraInput!)
-
+            // Configure front camera 
+            try frontCamera.lockForConfiguration()
+            if frontCamera.isFocusModeSupported(.continuousAutoFocus) {
+                frontCamera.focusMode = .continuousAutoFocus
+            }
+            frontCamera.unlockForConfiguration()
+    
+            if let newInput = try? AVCaptureDeviceInput(device: frontCamera),
+                captureSession.canAddInput(newInput) {
+                captureSession.addInput(newInput)
+                frontCameraInput = newInput
                 self.currentCameraPosition = .front
             } else {
                 throw CameraControllerError.invalidOperation
             }
         }
 
-        func switchToRearCamera() throws {
-
-            guard let frontCameraInput = self.frontCameraInput, captureSession.inputs.contains(frontCameraInput),
-                  let rearCamera = self.rearCamera else { throw CameraControllerError.invalidOperation }
-
-            self.rearCameraInput = try AVCaptureDeviceInput(device: rearCamera)
-
-            captureSession.removeInput(frontCameraInput)
-
-            if captureSession.canAddInput(self.rearCameraInput!) {
-                captureSession.addInput(self.rearCameraInput!)
-
-                self.currentCameraPosition = .rear
-            } else { throw CameraControllerError.invalidOperation }
+        // Re-add audio input if it existed
+        if let audioInput = audioInput, captureSession.canAddInput(audioInput) {
+            captureSession.addInput(audioInput)
         }
-
-        switch currentCameraPosition {
-        case .front:
-            try switchToRearCamera()
-
-        case .rear:
-            try switchToFrontCamera()
+        
+        // Update video orientation
+        DispatchQueue.main.async { [weak self] in
+            self?.updateVideoOrientation()
         }
-
-        captureSession.commitConfiguration()
     }
 
     func captureImage(completion: @escaping (UIImage?, Error?) -> Void) {
@@ -354,7 +399,25 @@ extension CameraController {
         return supportedFlashModesAsStrings
 
     }
+    func getHorizontalFov() throws -> Float {
+        var currentCamera: AVCaptureDevice?
+        switch currentCameraPosition {
+        case .front:
+            currentCamera = self.frontCamera!
+        case .rear:
+            currentCamera = self.rearCamera!
+        default: break
+        }
 
+        guard
+            let device = currentCamera
+        else {
+            throw CameraControllerError.noCamerasAvailable
+        }
+
+        return device.activeFormat.videoFieldOfView
+
+    }
     func setFlashMode(flashMode: AVCaptureDevice.FlashMode) throws {
         var currentCamera: AVCaptureDevice?
         switch currentCameraPosition {
@@ -424,32 +487,93 @@ extension CameraController {
         } catch {
             throw CameraControllerError.invalidOperation
         }
-
     }
 
-    func captureVideo(completion: @escaping (URL?, Error?) -> Void) {
-        guard let captureSession = self.captureSession, captureSession.isRunning else {
-            completion(nil, CameraControllerError.captureSessionIsMissing)
-            return
+    func cleanup() {
+        if let captureSession = self.captureSession {
+            captureSession.stopRunning()
+            captureSession.inputs.forEach { captureSession.removeInput($0) }
+            captureSession.outputs.forEach { captureSession.removeOutput($0) }
         }
-        let path = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+
+        self.previewLayer?.removeFromSuperlayer()
+        self.previewLayer = nil
+
+        self.frontCameraInput = nil
+        self.rearCameraInput = nil
+        self.audioInput = nil
+
+        self.frontCamera = nil
+        self.rearCamera = nil
+        self.audioDevice = nil
+
+        self.dataOutput = nil
+        self.photoOutput = nil
+        self.fileVideoOutput = nil
+
+        self.captureSession = nil
+        self.currentCameraPosition = nil
+    }
+
+    func captureVideo() throws {
+        guard let captureSession = self.captureSession, captureSession.isRunning else {
+            throw CameraControllerError.captureSessionIsMissing
+        }
+        guard let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            throw CameraControllerError.cannotFindDocumentsDirectory
+        }
+
+        guard let fileVideoOutput = self.fileVideoOutput else {
+            throw CameraControllerError.fileVideoOutputNotFound
+        }
+
+        // cpcp_video_A6C01203 - portrait
+        //
+        if let connection = fileVideoOutput.connection(with: .video) {
+            switch UIDevice.current.orientation {
+            case .landscapeRight:
+                connection.videoOrientation = .landscapeLeft
+            case .landscapeLeft:
+                connection.videoOrientation = .landscapeRight
+            case .portrait:
+                connection.videoOrientation = .portrait
+            case .portraitUpsideDown:
+                connection.videoOrientation = .portraitUpsideDown
+            default:
+                connection.videoOrientation = .portrait
+            }
+        }
+
         let identifier = UUID()
         let randomIdentifier = identifier.uuidString.replacingOccurrences(of: "-", with: "")
         let finalIdentifier = String(randomIdentifier.prefix(8))
         let fileName="cpcp_video_"+finalIdentifier+".mp4"
 
-        let fileUrl = path.appendingPathComponent(fileName)
+        let fileUrl = documentsDirectory.appendingPathComponent(fileName)
         try? FileManager.default.removeItem(at: fileUrl)
-        /*videoOutput!.startRecording(to: fileUrl, recordingDelegate: self)
-         self.videoRecordCompletionBlock = completion*/
+
+        // Start recording video
+        fileVideoOutput.startRecording(to: fileUrl, recordingDelegate: self)
+
+        // Save the file URL for later use
+        self.videoFileURL = fileUrl
     }
 
-    func stopRecording(completion: @escaping (Error?) -> Void) {
+    func stopRecording(completion: @escaping (URL?, Error?) -> Void) {
         guard let captureSession = self.captureSession, captureSession.isRunning else {
-            completion(CameraControllerError.captureSessionIsMissing)
+            completion(nil, CameraControllerError.captureSessionIsMissing)
             return
         }
-        // self.videoOutput?.stopRecording()
+        guard let fileVideoOutput = self.fileVideoOutput else {
+            completion(nil, CameraControllerError.fileVideoOutputNotFound)
+            return
+        }
+
+        // Stop recording video
+        fileVideoOutput.stopRecording()
+
+        // Return the video file URL in the completion handler
+        completion(self.videoFileURL, nil)
     }
 }
 
@@ -517,8 +641,10 @@ extension CameraController: UIGestureRecognizerDelegate {
 extension CameraController: AVCapturePhotoCaptureDelegate {
     public func photoOutput(_ captureOutput: AVCapturePhotoOutput, didFinishProcessingPhoto photoSampleBuffer: CMSampleBuffer?, previewPhoto previewPhotoSampleBuffer: CMSampleBuffer?,
                             resolvedSettings: AVCaptureResolvedPhotoSettings, bracketSettings: AVCaptureBracketedStillImageSettings?, error: Swift.Error?) {
-        if let error = error { self.photoCaptureCompletionBlock?(nil, error) } else if let buffer = photoSampleBuffer, let data = AVCapturePhotoOutput.jpegPhotoDataRepresentation(forJPEGSampleBuffer: buffer, previewPhotoSampleBuffer: nil),
-                                                                                       let image = UIImage(data: data) {
+        if let error = error {
+            self.photoCaptureCompletionBlock?(nil, error)
+        } else if let buffer = photoSampleBuffer, let data = AVCapturePhotoOutput.jpegPhotoDataRepresentation(forJPEGSampleBuffer: buffer, previewPhotoSampleBuffer: nil),
+                  let image = UIImage(data: data) {
             self.photoCaptureCompletionBlock?(image.fixedOrientation(), nil)
         } else {
             self.photoCaptureCompletionBlock?(nil, CameraControllerError.unknown)
@@ -574,6 +700,8 @@ enum CameraControllerError: Swift.Error {
     case inputsAreInvalid
     case invalidOperation
     case noCamerasAvailable
+    case cannotFindDocumentsDirectory
+    case fileVideoOutputNotFound
     case unknown
 }
 
@@ -597,7 +725,10 @@ extension CameraControllerError: LocalizedError {
             return NSLocalizedString("Failed to access device camera(s)", comment: "No Cameras Available")
         case .unknown:
             return NSLocalizedString("Unknown", comment: "Unknown")
-
+        case .cannotFindDocumentsDirectory:
+            return NSLocalizedString("Cannot find documents directory", comment: "This should never happen")
+        case .fileVideoOutputNotFound:
+            return NSLocalizedString("Video recording is not available. Make sure the camera is properly initialized.", comment: "Video recording not available")
         }
     }
 }
@@ -616,7 +747,10 @@ extension UIImage {
             return nil
         }
 
-        guard let colorSpace = cgImage.colorSpace, let ctx = CGContext(data: nil, width: Int(size.width), height: Int(size.height), bitsPerComponent: cgImage.bitsPerComponent, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+        guard let colorSpace = cgImage.colorSpace, let ctx = CGContext(data: nil,
+                                                                       width: Int(size.width), height: Int(size.height),
+                                                                       bitsPerComponent: cgImage.bitsPerComponent, bytesPerRow: 0,
+                                                                       space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
             return nil // Not able to create CGContext
         }
 
@@ -665,10 +799,11 @@ extension UIImage {
 
 extension CameraController: AVCaptureFileOutputRecordingDelegate {
     func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
-        /*if error == nil {
-         self.videoRecordCompletionBlock?(outputFileURL, nil)
-         } else {
-         self.videoRecordCompletionBlock?(nil, error)
-         }*/
+        if let error = error {
+            print("Error recording movie: \(error.localizedDescription)")
+        } else {
+            print("Movie recorded successfully: \(outputFileURL)")
+            // You can save the file to the library, upload it, etc.
+        }
     }
 }

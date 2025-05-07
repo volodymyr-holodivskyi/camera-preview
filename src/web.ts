@@ -14,7 +14,17 @@ export class CameraPreviewWeb extends WebPlugin implements CameraPreviewPlugin {
    *  track which camera is used based on start options
    *  used in capture
    */
-  private isBackCamera: boolean;
+  private isBackCamera = false;
+
+  constructor() {
+    super();
+  }
+
+  async getSupportedPictureSizes(): Promise<any> {
+    throw new Error(
+      "getSupportedPictureSizes not supported under the web platform",
+    );
+  }
 
   async start(options: CameraPreviewOptions): Promise<void> {
     // eslint-disable-next-line no-async-promise-executor

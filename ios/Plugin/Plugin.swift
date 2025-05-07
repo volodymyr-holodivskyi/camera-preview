@@ -1,20 +1,63 @@
 import Foundation
 import Capacitor
 import AVFoundation
+
+extension UIWindow {
+    static var isLandscape: Bool {
+        if #available(iOS 13.0, *) {
+            return UIApplication.shared.windows
+                .first?
+                .windowScene?
+                .interfaceOrientation
+                .isLandscape ?? false
+        } else {
+            return UIApplication.shared.statusBarOrientation.isLandscape
+        }
+    }
+    static var isPortrait: Bool {
+        if #available(iOS 13.0, *) {
+            return UIApplication.shared.windows
+                .first?
+                .windowScene?
+                .interfaceOrientation
+                .isPortrait ?? false
+        } else {
+            return UIApplication.shared.statusBarOrientation.isPortrait
+        }
+    }
+}
+
 /**
  * Please read the Capacitor iOS Plugin Development Guide
  * here: https://capacitor.ionicframework.com/docs/plugins/ios
  */
 @objc(CameraPreview)
-public class CameraPreview: CAPPlugin {
+public class CameraPreview: CAPPlugin, CAPBridgedPlugin {
+    public let identifier = "CameraPreviewPlugin"
+    public let jsName = "CameraPreview"
+    public let pluginMethods: [CAPPluginMethod] = [
+        CAPPluginMethod(name: "start", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "flip", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "capture", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "captureSample", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getSupportedFlashModes", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getHorizontalFov", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "setFlashMode", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "startRecordVideo", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "stopRecordVideo", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getTempFilePath", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "getSupportedPictureSizes", returnType: CAPPluginReturnPromise)
+    ]
+    // Camera state tracking
+    private var isInitializing: Bool = false
+    private var isInitialized: Bool = false
 
     var previewView: UIView!
     var cameraPosition = String()
     let cameraController = CameraController()
-    // swiftlint:disable identifier_name
-    var x: CGFloat?
-    var y: CGFloat?
-    // swiftlint:enable identifier_name
+    var posX: CGFloat?
+    var posY: CGFloat?
     var width: CGFloat?
     var height: CGFloat?
     var paddingBottom: CGFloat?
@@ -28,23 +71,127 @@ public class CameraPreview: CAPPlugin {
     @objc func rotated() {
         let height = self.paddingBottom != nil ? self.height! - self.paddingBottom!: self.height!
 
-        if UIApplication.shared.statusBarOrientation.isLandscape {
-            self.previewView.frame = CGRect(x: self.y!, y: self.x!, width: max(height, self.width!), height: min(height, self.width!))
+        if UIWindow.isLandscape {
+            self.previewView.frame = CGRect(x: self.posY!, y: self.posX!, width: max(height, self.width!), height: min(height, self.width!))
             self.cameraController.previewLayer?.frame = self.previewView.frame
         }
 
-        if UIApplication.shared.statusBarOrientation.isPortrait {
-            if self.previewView != nil && self.x != nil && self.y != nil && self.width != nil && self.height != nil {
-                self.previewView.frame = CGRect(x: self.x!, y: self.y!, width: min(height, self.width!), height: max(height, self.width!))
+        if UIWindow.isPortrait {
+            if self.previewView != nil && self.posX != nil && self.posY != nil && self.width != nil && self.height != nil {
+                self.previewView.frame = CGRect(x: self.posX!, y: self.posY!, width: min(height, self.width!), height: max(height, self.width!))
             }
             self.cameraController.previewLayer?.frame = self.previewView.frame
+        }
+
+        if let connection = self.cameraController.fileVideoOutput?.connection(with: .video) {
+            switch UIDevice.current.orientation {
+            case .landscapeRight:
+                connection.videoOrientation = .landscapeLeft
+            case .landscapeLeft:
+                connection.videoOrientation = .landscapeRight
+            case .portrait:
+                connection.videoOrientation = .portrait
+            case .portraitUpsideDown:
+                connection.videoOrientation = .portraitUpsideDown
+            default:
+                connection.videoOrientation = .portrait
+            }
         }
 
         cameraController.updateVideoOrientation()
     }
 
+    struct CameraInfo {
+        let deviceID: String
+        let position: String
+        let pictureSizes: [CGSize]
+    }
+
+    func getSupportedPictureSizes() -> [CameraInfo] {
+        var cameraInfos = [CameraInfo]()
+
+        // Discover all available cameras
+        let deviceTypes: [AVCaptureDevice.DeviceType] = [
+            .builtInWideAngleCamera,
+            .builtInTelephotoCamera,
+            .builtInUltraWideCamera,
+            .builtInTrueDepthCamera
+        ]
+
+        let session = AVCaptureDevice.DiscoverySession(
+            deviceTypes: deviceTypes,
+            mediaType: .video,
+            position: .unspecified
+        )
+
+        let devices = session.devices
+
+        for device in devices {
+            // Determine the position of the camera
+            var position = "Unknown"
+            switch device.position {
+            case .front:
+                position = "Front"
+            case .back:
+                position = "Back"
+            case .unspecified:
+                position = "Unspecified"
+            @unknown default:
+                position = "Unknown"
+            }
+
+            var pictureSizes = [CGSize]()
+
+            // Get supported formats
+            for format in device.formats {
+                let description = format.formatDescription
+                let dimensions = CMVideoFormatDescriptionGetDimensions(description)
+                let size = CGSize(width: CGFloat(dimensions.width), height: CGFloat(dimensions.height))
+                if !pictureSizes.contains(size) {
+                    pictureSizes.append(size)
+                }
+            }
+
+            // Sort sizes in descending order (largest to smallest)
+            pictureSizes.sort { $0.width * $0.height > $1.width * $1.height }
+
+            let cameraInfo = CameraInfo(deviceID: device.uniqueID, position: position, pictureSizes: pictureSizes)
+            cameraInfos.append(cameraInfo)
+        }
+
+        return cameraInfos
+    }
+
+    @objc func getSupportedPictureSizes(_ call: CAPPluginCall) {
+        let cameraInfos = getSupportedPictureSizes()
+        call.resolve([
+            "supportedPictureSizes": cameraInfos.map {
+                return [
+                    "facing": $0.position,
+                    "supportedPictureSizes": $0.pictureSizes.map { size in
+                        return [
+                            "width": String(describing: size.width),
+                            "height": String(describing: size.height)
+                        ]
+                    }
+                ]
+            }
+        ])
+    }
+
     @objc func start(_ call: CAPPluginCall) {
+        if self.isInitializing {
+            call.reject("camera initialization in progress")
+            return
+        }
+        if self.isInitialized {
+            call.reject("camera already started")
+            return
+        }
+        self.isInitializing = true
+
         self.cameraPosition = call.getString("position") ?? "rear"
+        let cameraMode = call.getBool("cameraMode") ?? false
         self.highResolutionOutput = call.getBool("enableHighResolution") ?? false
         self.cameraController.highResolutionOutput = self.highResolutionOutput
 
@@ -58,8 +205,8 @@ public class CameraPreview: CAPPlugin {
         } else {
             self.height = UIScreen.main.bounds.size.height
         }
-        self.x = call.getInt("x") != nil ? CGFloat(call.getInt("x")!)/UIScreen.main.scale: 0
-        self.y = call.getInt("y") != nil ? CGFloat(call.getInt("y")!)/UIScreen.main.scale: 0
+        self.posX = call.getInt("x") != nil ? CGFloat(call.getInt("x")!)/UIScreen.main.scale: 0
+        self.posY = call.getInt("y") != nil ? CGFloat(call.getInt("y")!) / (call.getBool("includeSafeAreaInsets") ?? false ? 1.0 : UIScreen.main.scale) + (call.getBool("includeSafeAreaInsets") ?? false ? UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0 : 0) : 0
         if call.getInt("paddingBottom") != nil {
             self.paddingBottom = CGFloat(call.getInt("paddingBottom")!)
         }
@@ -80,14 +227,14 @@ public class CameraPreview: CAPPlugin {
                 if self.cameraController.captureSession?.isRunning ?? false {
                     call.reject("camera already started")
                 } else {
-                    self.cameraController.prepare(cameraPosition: self.cameraPosition, disableAudio: self.disableAudio) {error in
+                    self.cameraController.prepare(cameraPosition: self.cameraPosition, disableAudio: self.disableAudio, cameraMode: cameraMode) {error in
                         if let error = error {
                             print(error)
                             call.reject(error.localizedDescription)
                             return
                         }
                         let height = self.paddingBottom != nil ? self.height! - self.paddingBottom!: self.height!
-                        self.previewView = UIView(frame: CGRect(x: self.x ?? 0, y: self.y ?? 0, width: self.width!, height: height))
+                        self.previewView = UIView(frame: CGRect(x: self.posX ?? 0, y: self.posY ?? 0, width: self.width!, height: height))
                         self.webView?.isOpaque = false
                         self.webView?.backgroundColor = UIColor.clear
                         self.webView?.scrollView.backgroundColor = UIColor.clear
@@ -104,6 +251,8 @@ public class CameraPreview: CAPPlugin {
                             NotificationCenter.default.addObserver(self, selector: #selector(CameraPreview.rotated), name: UIDevice.orientationDidChangeNotification, object: nil)
                         }
 
+                        self.isInitializing = false
+                        self.isInitialized = true
                         call.resolve()
 
                     }
@@ -114,24 +263,80 @@ public class CameraPreview: CAPPlugin {
     }
 
     @objc func flip(_ call: CAPPluginCall) {
-        do {
-            try self.cameraController.switchCameras()
-            call.resolve()
-        } catch {
-            call.reject("failed to flip camera")
+        guard isInitialized else {
+            call.reject("Camera not initialized")
+            return
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                call.reject("Camera controller deallocated")
+                return
+            }
+            
+            // Disable user interaction during flip
+            self.previewView.isUserInteractionEnabled = false
+            
+            // Perform camera switch on background thread
+            DispatchQueue.global(qos: .userInitiated).async {
+                var retryCount = 0
+                let maxRetries = 3
+                
+                func attemptFlip() {
+                    do {
+                        try self.cameraController.switchCameras()
+                        
+                        DispatchQueue.main.async {
+                            self.cameraController.previewLayer?.frame = self.previewView.bounds
+                            self.cameraController.previewLayer?.videoGravity = .resizeAspectFill
+                            self.previewView.isUserInteractionEnabled = true
+                            call.resolve()
+                        }
+                    } catch {
+                        retryCount += 1
+                        
+                        if retryCount < maxRetries {
+                            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) {
+                                attemptFlip()
+                            }
+                        } else {
+                            DispatchQueue.main.async {
+                                self.previewView.isUserInteractionEnabled = true
+                                print("Failed to flip camera after \(maxRetries) attempts: \(error.localizedDescription)")
+                                call.reject("Failed to flip camera: \(error.localizedDescription)")
+                            }
+                        }
+                    }
+                }
+                
+                attemptFlip()
+            }
         }
     }
 
     @objc func stop(_ call: CAPPluginCall) {
         DispatchQueue.main.async {
-            if self.cameraController.captureSession?.isRunning ?? false {
-                self.cameraController.captureSession?.stopRunning()
-                self.previewView.removeFromSuperview()
-                self.webView?.isOpaque = true
-                call.resolve()
-            } else {
-                call.reject("camera already stopped")
+            if self.isInitializing {
+                call.reject("cannot stop camera while initialization is in progress")
+                return
             }
+            if !self.isInitialized {
+                call.reject("camera not initialized")
+                return
+            }
+            
+            // Always attempt to stop and clean up, regardless of captureSession state
+            if let previewView = self.previewView {
+                previewView.removeFromSuperview()
+                self.previewView = nil
+            }
+            
+            self.webView?.isOpaque = true
+            self.isInitialized = false
+            self.isInitializing = false
+            self.cameraController.cleanup()
+            
+            call.resolve()
         }
     }
     // Get user's cache directory path
@@ -229,6 +434,15 @@ public class CameraPreview: CAPPlugin {
         }
     }
 
+    @objc func getHorizontalFov(_ call: CAPPluginCall) {
+        do {
+            let horizontalFov = try self.cameraController.getHorizontalFov()
+            call.resolve(["result": horizontalFov])
+        } catch {
+            call.reject("failed to get FOV")
+        }
+    }
+
     @objc func setFlashMode(_ call: CAPPluginCall) {
         guard let flashMode = call.getString("flashMode") else {
             call.reject("failed to set flash mode. required parameter flashMode is missing")
@@ -261,41 +475,29 @@ public class CameraPreview: CAPPlugin {
 
     @objc func startRecordVideo(_ call: CAPPluginCall) {
         DispatchQueue.main.async {
+            do {
+                try self.cameraController.captureVideo()
+                call.resolve()
+            } catch {
+                call.reject(error.localizedDescription)
+            }
+        }
+    }
 
-            let quality: Int? = call.getInt("quality", 85)
-
-            self.cameraController.captureVideo { (image, error) in
-
-                guard let image = image else {
-                    print(error ?? "Image capture error")
+    @objc func stopRecordVideo(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            self.cameraController.stopRecording { (fileURL, error) in
+                guard let fileURL = fileURL else {
+                    print(error ?? "Video capture error")
                     guard let error = error else {
-                        call.reject("Image capture error")
+                        call.reject("Video capture error")
                         return
                     }
                     call.reject(error.localizedDescription)
                     return
                 }
 
-                // self.videoUrl = image
-
-                call.resolve(["value": image.absoluteString])
-            }
-        }
-    }
-
-    @objc func stopRecordVideo(_ call: CAPPluginCall) {
-
-        self.cameraController.stopRecording { (_) in
-
-        }
-    }
-
-    @objc func isCameraStarted(_ call: CAPPluginCall) {
-        DispatchQueue.main.async {
-            if self.cameraController.captureSession?.isRunning ?? false {
-                call.resolve(["value": true])
-            } else {
-                call.resolve(["value": false])
+                call.resolve(["videoFilePath": fileURL.absoluteString])
             }
         }
     }
